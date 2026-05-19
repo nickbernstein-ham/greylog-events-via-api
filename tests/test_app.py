@@ -81,10 +81,7 @@ def test_int_from_env_parses_integer():
 
 
 def test_redact_pii_redacts_common_values():
-    text = (
-        "login user=nick@example.com phone=308-555-1212 "
-        "ip=192.168.1.25 password=supersecret"
-    )
+    text = "login user=nick@example.com phone=308-555-1212 " "ip=192.168.1.25 password=supersecret"
 
     result = app.redact_pii(text)
 

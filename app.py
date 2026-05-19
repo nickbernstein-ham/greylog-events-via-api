@@ -41,14 +41,14 @@ import os
 import re
 import socket
 import sys
+from collections.abc import Callable, Iterable
 from functools import reduce
-from typing import Any, Callable, Iterable
+from typing import Any
 from urllib.parse import urljoin
 
 import requests
 from requests import Response
 from requests.auth import HTTPBasicAuth
-
 
 DEFAULT_GREYLOG_URL = "https://sip.hamiltoncaptel.com:9000"
 DEFAULT_STREAM_NAME = "test"
@@ -504,10 +504,7 @@ def redact_ipv4_addresses(text: str) -> tuple[str, tuple[JsonDict, ...]]:
     return regex_redact(
         text=text,
         pii_type="ipv4_address",
-        pattern=(
-            r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
-            r"(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"
-        ),
+        pattern=(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}" r"(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
         replacement="[REDACTED_IP]",
     )
 
@@ -1196,10 +1193,7 @@ def build_syslog_message(
     remaining_bytes = max(max_bytes - len(base_message.encode("utf-8")) - 32, 0)
     truncated_json = truncate_utf8_bytes(full_json, remaining_bytes)
 
-    return (
-        f"{base_message}"
-        f'enriched_json="{sanitize_syslog_value(truncated_json)}"'
-    )
+    return f"{base_message}" f'enriched_json="{sanitize_syslog_value(truncated_json)}"'
 
 
 def send_syslog_udp(host: str, port: int, message: str) -> JsonDict:
@@ -1570,7 +1564,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     parser.add_argument("--url", default=os.getenv("GRAYLOG_URL", DEFAULT_GREYLOG_URL))
     parser.add_argument("--stream", default=os.getenv("GRAYLOG_STREAM", DEFAULT_STREAM_NAME))
-    parser.add_argument("--limit", type=int, default=int_from_env(os.getenv("GRAYLOG_LIMIT"), DEFAULT_LIMIT))
+    parser.add_argument(
+        "--limit", type=int, default=int_from_env(os.getenv("GRAYLOG_LIMIT"), DEFAULT_LIMIT)
+    )
     parser.add_argument(
         "--range-seconds",
         type=int,
