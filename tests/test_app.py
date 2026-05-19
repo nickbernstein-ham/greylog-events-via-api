@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-import greylog_recent_stream_events as app
+import app
 
 
 def sample_enriched_message():
@@ -104,7 +104,7 @@ def test_redact_authorization_header():
 
     assert result["pii_detected"] is True
     assert "abcdef123456" not in result["redacted_text"]
-    assert "authorization: [REDACTED_SECRET]" in result["redacted_text"].lower()
+    assert "authorization: [REDACTED_SECRET]" in result["redacted_text"]
 
 
 def test_redact_ssn():
