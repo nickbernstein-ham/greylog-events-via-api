@@ -5,13 +5,14 @@ the enriched results back to Greylog.
 
 Supported postback methods:
 
-    syslog_udp  - Send enriched messages to an existing Greylog Syslog UDP input.
-    gelf_http   - Send enriched messages to a Greylog GELF HTTP input.
+    gelf_tcp   - Send enriched messages to a Greylog GELF TCP input.
+    syslog_udp - Optional fallback for an existing Greylog Syslog UDP input.
 
 Expected .env example:
 
     GRAYLOG_TOKEN='your-greylog-token'
     GRAYLOG_URL='https://sip.hamiltoncaptel.com:9000'
+    GRAYLOG_STREAM='Test'
 
     OLLAMA_API_BASE='http://127.0.0.1:11434'
     OLLAMA_MODEL='qwen3:1.7b'
@@ -20,14 +21,11 @@ Expected .env example:
 
     POST_OUTPUT_TO_GRAYLOG=true
     GRAYLOG_OUTPUT_STREAM='nick-ollama-out'
-    GRAYLOG_OUTPUT_METHOD='syslog_udp'
-    GRAYLOG_SYSLOG_HOST='sip.hamiltoncaptel.com'
-    GRAYLOG_SYSLOG_PORT='514'
+    GRAYLOG_OUTPUT_METHOD='gelf_tcp'
 
-Optional GELF HTTP settings:
-
-    GRAYLOG_OUTPUT_METHOD='gelf_http'
-    GRAYLOG_GELF_HTTP_URL='http://sip.hamiltoncaptel.com:12201/gelf'
+    GRAYLOG_GELF_TCP_HOST='sip.hamiltoncaptel.com'
+    GRAYLOG_GELF_TCP_PORT='12201'
+    GRAYLOG_GELF_TCP_TLS=false
 """
 
 from __future__ import annotations
@@ -40,6 +38,7 @@ import logging
 import os
 import re
 import socket
+import ssl
 import sys
 from collections.abc import Callable, Iterable
 from functools import reduce
@@ -51,14 +50,24 @@ from requests import Response
 from requests.auth import HTTPBasicAuth
 
 DEFAULT_GREYLOG_URL = "https://sip.hamiltoncaptel.com:9000"
-DEFAULT_STREAM_NAME = "test"
+DEFAULT_STREAM_NAME = "Test"
 DEFAULT_OUTPUT_STREAM = "nick-ollama-out"
-DEFAULT_OUTPUT_METHOD = "syslog_udp"
+DEFAULT_OUTPUT_METHOD = "gelf_tcp"
 DEFAULT_LIMIT = 10
 DEFAULT_RANGE_SECONDS = 86_400
+
 DEFAULT_OLLAMA_API_BASE = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:1.7b"
+
 DEFAULT_LOG_LEVEL = "INFO"
+
+DEFAULT_GELF_TCP_HOST = "sip.hamiltoncaptel.com"
+DEFAULT_GELF_TCP_PORT = 12201
+DEFAULT_GELF_TCP_TIMEOUT = 10.0
+DEFAULT_GELF_TCP_TLS = False
+DEFAULT_GELF_TCP_INSECURE_TLS = False
+DEFAULT_MAX_GELF_FULL_MESSAGE_BYTES = 60_000
+
 DEFAULT_SYSLOG_HOST = "sip.hamiltoncaptel.com"
 DEFAULT_SYSLOG_PORT = 514
 DEFAULT_MAX_SYSLOG_BYTES = 60_000
@@ -124,6 +133,25 @@ def int_from_env(value: str | None, default: int) -> int:
 
     try:
         return int(value)
+    except ValueError:
+        return default
+
+
+def float_from_env(value: str | None, default: float) -> float:
+    """Parse a float environment-style string.
+
+    Args:
+        value: Environment string.
+        default: Default value when value is missing or invalid.
+
+    Returns:
+        Parsed float value.
+    """
+    if value is None:
+        return default
+
+    try:
+        return float(value)
     except ValueError:
         return default
 
@@ -216,7 +244,7 @@ def get_json(session: requests.Session, url: str, params: JsonDict | None = None
     return response.json()
 
 
-def post_json(url: str, payload: JsonDict, timeout: int = 120) -> JsonDict:
+def post_json(url: str, payload: JsonDict, timeout: float = 120.0) -> JsonDict:
     """Perform a JSON POST request and return the decoded JSON response.
 
     Args:
@@ -1078,6 +1106,15 @@ def severity_to_syslog_level(severity_hint: str) -> int:
     }.get(severity_hint, 5)
 
 
+def unix_timestamp_now() -> float:
+    """Return the current UTC Unix timestamp.
+
+    Returns:
+        Current UTC Unix timestamp as a float.
+    """
+    return datetime.datetime.now(datetime.UTC).timestamp()
+
+
 def rfc3339_utc_now() -> str:
     """Return the current UTC timestamp in RFC3339 format.
 
@@ -1114,8 +1151,239 @@ def truncate_utf8_bytes(text: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return text
 
-    truncated = encoded[:max_bytes]
-    return truncated.decode("utf-8", errors="ignore") + "...[TRUNCATED]"
+    suffix = "...[TRUNCATED]"
+    suffix_bytes = suffix.encode("utf-8")
+
+    if max_bytes <= len(suffix_bytes):
+        return suffix[:max_bytes]
+
+    truncated = encoded[: max_bytes - len(suffix_bytes)]
+    return truncated.decode("utf-8", errors="ignore") + suffix
+
+
+def compact_json(value: Any) -> str:
+    """Serialize a value as compact JSON.
+
+    Args:
+        value: Value to serialize.
+
+    Returns:
+        Compact JSON string.
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def remove_none_values(fields: JsonDict) -> JsonDict:
+    """Remove keys with None values from a dictionary.
+
+    Args:
+        fields: Input dictionary.
+
+    Returns:
+        Dictionary without None values.
+    """
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def build_gelf_custom_fields(enriched_message: JsonDict, output_stream: str) -> JsonDict:
+    """Build GELF custom fields for enriched messages.
+
+    GELF custom fields must begin with an underscore.
+
+    Args:
+        enriched_message: Enriched message dictionary.
+        output_stream: Desired Greylog output stream marker.
+
+    Returns:
+        GELF custom field dictionary.
+    """
+    context = enriched_message.get("context", {})
+    return remove_none_values(
+        {
+            "_ollama_output_stream": output_stream,
+            "_pipeline": "greylog-ollama-enrichment",
+            "_original_greylog_id": enriched_message.get("id"),
+            "_original_greylog_index": enriched_message.get("index"),
+            "_original_source": enriched_message.get("source"),
+            "_original_timestamp": enriched_message.get("timestamp"),
+            "_pii_detected": enriched_message.get("pii", {}).get("detected", False),
+            "_pii_findings": compact_json(enriched_message.get("pii", {}).get("findings", [])),
+            "_ollama_model": enriched_message.get("ollama", {}).get("model"),
+            "_redaction_tool_requested": enriched_message.get("ollama", {}).get(
+                "redaction_tool_requested"
+            ),
+            "_likely_component": context.get("likely_component"),
+            "_likely_event_type": context.get("likely_event_type"),
+            "_severity_hint": context.get("severity_hint", "unknown"),
+        }
+    )
+
+
+def build_gelf_payload(
+    enriched_message: JsonDict,
+    output_stream: str,
+    host: str,
+    max_full_message_bytes: int,
+) -> JsonDict:
+    """Build a GELF payload for posting enriched logs back to Greylog over TCP.
+
+    Args:
+        enriched_message: Enriched message dictionary.
+        output_stream: Desired output stream marker.
+        host: Host value to use in the GELF message.
+        max_full_message_bytes: Maximum byte length for the GELF full_message field.
+
+    Returns:
+        GELF-compatible JSON payload.
+    """
+    context = enriched_message.get("context", {})
+    severity_hint = str(context.get("severity_hint", "unknown"))
+    summary = str(context.get("summary") or "Ollama-enriched Greylog event")
+    full_message = truncate_utf8_bytes(
+        compact_json(enriched_message),
+        max_full_message_bytes,
+    )
+
+    base_payload = {
+        "version": "1.1",
+        "host": host,
+        "short_message": summary[:250],
+        "full_message": full_message,
+        "timestamp": unix_timestamp_now(),
+        "level": severity_to_syslog_level(severity_hint),
+    }
+
+    return {
+        **base_payload,
+        **build_gelf_custom_fields(enriched_message, output_stream),
+    }
+
+
+def encode_gelf_tcp_frame(payload: JsonDict) -> bytes:
+    """Encode a GELF TCP frame.
+
+    GELF TCP expects a single JSON message followed by a null byte delimiter.
+
+    Args:
+        payload: GELF-compatible JSON payload.
+
+    Returns:
+        UTF-8 encoded GELF TCP frame.
+    """
+    return compact_json(payload).encode("utf-8") + b"\0"
+
+
+def create_tcp_connection(
+    host: str,
+    port: int,
+    timeout: float,
+    use_tls: bool,
+    insecure_tls: bool,
+) -> socket.socket | ssl.SSLSocket:
+    """Create a TCP or TLS-wrapped TCP connection.
+
+    Args:
+        host: Destination host.
+        port: Destination TCP port.
+        timeout: Socket timeout in seconds.
+        use_tls: Whether to wrap the socket with TLS.
+        insecure_tls: Whether to disable TLS certificate verification.
+
+    Returns:
+        Connected socket object.
+    """
+    raw_socket = socket.create_connection((host, port), timeout=timeout)
+
+    if not use_tls:
+        return raw_socket
+
+    context = ssl._create_unverified_context() if insecure_tls else ssl.create_default_context()
+    return context.wrap_socket(raw_socket, server_hostname=host)
+
+
+def send_gelf_tcp(
+    host: str,
+    port: int,
+    payload: JsonDict,
+    timeout: float,
+    use_tls: bool,
+    insecure_tls: bool,
+) -> JsonDict:
+    """Send one GELF payload over TCP.
+
+    Args:
+        host: GELF TCP destination host.
+        port: GELF TCP destination port.
+        payload: GELF-compatible JSON payload.
+        timeout: Socket timeout in seconds.
+        use_tls: Whether to use TLS.
+        insecure_tls: Whether to disable TLS certificate verification.
+
+    Returns:
+        Send result metadata.
+    """
+    frame = encode_gelf_tcp_frame(payload)
+
+    with create_tcp_connection(
+        host=host,
+        port=port,
+        timeout=timeout,
+        use_tls=use_tls,
+        insecure_tls=insecure_tls,
+    ) as sock:
+        sock.sendall(frame)
+
+    return {
+        "posted": True,
+        "method": "gelf_tcp",
+        "host": host,
+        "port": port,
+        "tls": use_tls,
+        "frame_bytes": len(frame),
+    }
+
+
+def post_gelf_tcp_message(
+    enriched_message: JsonDict,
+    output_stream: str,
+    gelf_tcp_host: str,
+    gelf_tcp_port: int,
+    output_host: str,
+    timeout: float,
+    use_tls: bool,
+    insecure_tls: bool,
+    max_full_message_bytes: int,
+) -> JsonDict:
+    """Post one enriched message to Greylog through GELF TCP.
+
+    Args:
+        enriched_message: Enriched message dictionary.
+        output_stream: Desired Greylog output stream marker.
+        gelf_tcp_host: Greylog GELF TCP input host.
+        gelf_tcp_port: Greylog GELF TCP input port.
+        output_host: Hostname to put in the GELF message.
+        timeout: Socket timeout in seconds.
+        use_tls: Whether to use TLS.
+        insecure_tls: Whether to disable TLS certificate verification.
+        max_full_message_bytes: Maximum byte length for GELF full_message.
+
+    Returns:
+        Send result metadata.
+    """
+    payload = build_gelf_payload(
+        enriched_message=enriched_message,
+        output_stream=output_stream,
+        host=output_host,
+        max_full_message_bytes=max_full_message_bytes,
+    )
+    return send_gelf_tcp(
+        host=gelf_tcp_host,
+        port=gelf_tcp_port,
+        payload=payload,
+        timeout=timeout,
+        use_tls=use_tls,
+        insecure_tls=insecure_tls,
+    )
 
 
 def build_syslog_fields(enriched_message: JsonDict, output_stream: str) -> JsonDict:
@@ -1123,7 +1391,7 @@ def build_syslog_fields(enriched_message: JsonDict, output_stream: str) -> JsonD
 
     Args:
         enriched_message: Enriched message dictionary.
-        output_stream: Desired Greylog output stream name.
+        output_stream: Desired Greylog output stream marker.
 
     Returns:
         Dictionary of fields to place in the syslog message body.
@@ -1170,7 +1438,7 @@ def build_syslog_message(
 
     Args:
         enriched_message: Enriched message dictionary.
-        output_stream: Desired Greylog output stream name.
+        output_stream: Desired Greylog output stream marker.
         host: Hostname to use in the syslog message.
         max_bytes: Maximum message size in bytes.
 
@@ -1189,11 +1457,11 @@ def build_syslog_message(
         f'summary="{sanitize_syslog_value(summary)}" '
     )
 
-    full_json = json.dumps(enriched_message, sort_keys=True, default=str)
+    full_json = compact_json(enriched_message)
     remaining_bytes = max(max_bytes - len(base_message.encode("utf-8")) - 32, 0)
     truncated_json = truncate_utf8_bytes(full_json, remaining_bytes)
 
-    return f"{base_message}" f'enriched_json="{sanitize_syslog_value(truncated_json)}"'
+    return f'{base_message}enriched_json="{sanitize_syslog_value(truncated_json)}"'
 
 
 def send_syslog_udp(host: str, port: int, message: str) -> JsonDict:
@@ -1233,7 +1501,7 @@ def post_syslog_udp_message(
 
     Args:
         enriched_message: Enriched message dictionary.
-        output_stream: Desired Greylog output stream name.
+        output_stream: Desired Greylog output stream marker.
         syslog_host: Greylog syslog UDP input host.
         syslog_port: Greylog syslog UDP input port.
         output_host: Hostname to put in the syslog message.
@@ -1249,97 +1517,6 @@ def post_syslog_udp_message(
         max_bytes=max_bytes,
     )
     return send_syslog_udp(syslog_host, syslog_port, message)
-
-
-def build_gelf_payload(enriched_message: JsonDict, output_stream: str, host: str) -> JsonDict:
-    """Build a GELF payload for posting enriched logs back to Greylog.
-
-    Args:
-        enriched_message: Enriched message dictionary.
-        output_stream: Desired output stream name.
-        host: Host value to use in the GELF message.
-
-    Returns:
-        GELF-compatible JSON payload.
-    """
-    context = enriched_message.get("context", {})
-    severity_hint = str(context.get("severity_hint", "unknown"))
-    summary = str(context.get("summary") or "Ollama-enriched Greylog event")
-
-    return {
-        "version": "1.1",
-        "host": host,
-        "short_message": summary[:250],
-        "full_message": json.dumps(enriched_message, sort_keys=True, default=str),
-        "level": severity_to_syslog_level(severity_hint),
-        "_ollama_output_stream": output_stream,
-        "_pipeline": "greylog-ollama-enrichment",
-        "_original_greylog_id": enriched_message.get("id"),
-        "_original_greylog_index": enriched_message.get("index"),
-        "_original_source": enriched_message.get("source"),
-        "_original_timestamp": enriched_message.get("timestamp"),
-        "_pii_detected": enriched_message.get("pii", {}).get("detected", False),
-        "_ollama_model": enriched_message.get("ollama", {}).get("model"),
-        "_likely_component": context.get("likely_component"),
-        "_likely_event_type": context.get("likely_event_type"),
-        "_severity_hint": severity_hint,
-    }
-
-
-def post_gelf_payload(
-    gelf_http_url: str,
-    payload: JsonDict,
-    verify_tls: bool,
-    timeout: int = 30,
-) -> JsonDict:
-    """Post a GELF payload to Greylog.
-
-    Args:
-        gelf_http_url: GELF HTTP input URL.
-        payload: GELF-compatible JSON payload.
-        verify_tls: Whether to verify TLS certificates.
-        timeout: HTTP timeout in seconds.
-
-    Returns:
-        Post result metadata.
-    """
-    response = requests.post(
-        gelf_http_url,
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=timeout,
-        verify=verify_tls,
-    )
-    response.raise_for_status()
-    return {
-        "posted": True,
-        "method": "gelf_http",
-        "status_code": response.status_code,
-        "url": gelf_http_url,
-    }
-
-
-def post_gelf_http_message(
-    enriched_message: JsonDict,
-    gelf_http_url: str,
-    output_stream: str,
-    host: str,
-    verify_tls: bool,
-) -> JsonDict:
-    """Post one enriched message to Greylog through GELF HTTP.
-
-    Args:
-        enriched_message: Enriched message dictionary.
-        gelf_http_url: GELF HTTP input URL.
-        output_stream: Desired output stream name.
-        host: Host value to use in the GELF message.
-        verify_tls: Whether to verify TLS certificates.
-
-    Returns:
-        Post result metadata.
-    """
-    payload = build_gelf_payload(enriched_message, output_stream, host)
-    return post_gelf_payload(gelf_http_url, payload, verify_tls)
 
 
 def fetch_greylog_messages(args: argparse.Namespace) -> tuple[JsonDict, ...]:
@@ -1380,6 +1557,19 @@ def maybe_post_enriched_message(args: argparse.Namespace, enriched_message: Json
     if not args.post_output:
         return {"posted": False, "reason": "disabled"}
 
+    if args.output_method == "gelf_tcp":
+        return post_gelf_tcp_message(
+            enriched_message=enriched_message,
+            output_stream=args.output_stream,
+            gelf_tcp_host=args.gelf_tcp_host,
+            gelf_tcp_port=args.gelf_tcp_port,
+            output_host=args.output_host,
+            timeout=args.gelf_tcp_timeout,
+            use_tls=args.gelf_tcp_tls,
+            insecure_tls=args.gelf_tcp_insecure_tls,
+            max_full_message_bytes=args.max_gelf_full_message_bytes,
+        )
+
     if args.output_method == "syslog_udp":
         return post_syslog_udp_message(
             enriched_message=enriched_message,
@@ -1388,18 +1578,6 @@ def maybe_post_enriched_message(args: argparse.Namespace, enriched_message: Json
             syslog_port=args.syslog_port,
             output_host=args.output_host,
             max_bytes=args.max_syslog_bytes,
-        )
-
-    if args.output_method == "gelf_http":
-        if not args.gelf_http_url:
-            return {"posted": False, "reason": "missing_gelf_http_url"}
-
-        return post_gelf_http_message(
-            enriched_message=enriched_message,
-            gelf_http_url=args.gelf_http_url,
-            output_stream=args.output_stream,
-            host=args.output_host,
-            verify_tls=not args.insecure_gelf,
         )
 
     return {
@@ -1468,7 +1646,8 @@ def process_message(
         id=enriched.get("id"),
         posted=postback.get("posted"),
         method=postback.get("method"),
-        status_code=postback.get("status_code"),
+        host=postback.get("host"),
+        port=postback.get("port"),
         reason=postback.get("reason"),
         output_stream=args.output_stream,
     )
@@ -1517,7 +1696,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> tuple[JsonDict, ...
         output_stream=args.output_stream,
         output_method=args.output_method,
         post_output=args.post_output,
-        gelf_http_url_configured=bool(args.gelf_http_url),
+        gelf_tcp_host=args.gelf_tcp_host,
+        gelf_tcp_port=args.gelf_tcp_port,
+        gelf_tcp_tls=args.gelf_tcp_tls,
         syslog_host=args.syslog_host,
         syslog_port=args.syslog_port,
         ollama_model=args.ollama_model,
@@ -1565,7 +1746,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--url", default=os.getenv("GRAYLOG_URL", DEFAULT_GREYLOG_URL))
     parser.add_argument("--stream", default=os.getenv("GRAYLOG_STREAM", DEFAULT_STREAM_NAME))
     parser.add_argument(
-        "--limit", type=int, default=int_from_env(os.getenv("GRAYLOG_LIMIT"), DEFAULT_LIMIT)
+        "--limit",
+        type=int,
+        default=int_from_env(os.getenv("GRAYLOG_LIMIT"), DEFAULT_LIMIT),
     )
     parser.add_argument(
         "--range-seconds",
@@ -1592,9 +1775,52 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-method",
-        choices=("syslog_udp", "gelf_http"),
+        choices=("gelf_tcp", "syslog_udp"),
         default=os.getenv("GRAYLOG_OUTPUT_METHOD", DEFAULT_OUTPUT_METHOD),
     )
+
+    parser.add_argument(
+        "--gelf-tcp-host",
+        default=os.getenv("GRAYLOG_GELF_TCP_HOST", DEFAULT_GELF_TCP_HOST),
+    )
+    parser.add_argument(
+        "--gelf-tcp-port",
+        type=int,
+        default=int_from_env(os.getenv("GRAYLOG_GELF_TCP_PORT"), DEFAULT_GELF_TCP_PORT),
+    )
+    parser.add_argument(
+        "--gelf-tcp-timeout",
+        type=float,
+        default=float_from_env(os.getenv("GRAYLOG_GELF_TCP_TIMEOUT"), DEFAULT_GELF_TCP_TIMEOUT),
+    )
+    parser.add_argument(
+        "--gelf-tcp-tls",
+        dest="gelf_tcp_tls",
+        action="store_true",
+        default=bool_from_env(os.getenv("GRAYLOG_GELF_TCP_TLS"), DEFAULT_GELF_TCP_TLS),
+    )
+    parser.add_argument(
+        "--no-gelf-tcp-tls",
+        dest="gelf_tcp_tls",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--gelf-tcp-insecure-tls",
+        action="store_true",
+        default=bool_from_env(
+            os.getenv("GRAYLOG_GELF_TCP_INSECURE_TLS"),
+            DEFAULT_GELF_TCP_INSECURE_TLS,
+        ),
+    )
+    parser.add_argument(
+        "--max-gelf-full-message-bytes",
+        type=int,
+        default=int_from_env(
+            os.getenv("MAX_GELF_FULL_MESSAGE_BYTES"),
+            DEFAULT_MAX_GELF_FULL_MESSAGE_BYTES,
+        ),
+    )
+
     parser.add_argument(
         "--syslog-host",
         default=os.getenv("GRAYLOG_SYSLOG_HOST", DEFAULT_SYSLOG_HOST),
@@ -1609,7 +1835,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=int_from_env(os.getenv("MAX_SYSLOG_BYTES"), DEFAULT_MAX_SYSLOG_BYTES),
     )
-    parser.add_argument("--gelf-http-url", default=os.getenv("GRAYLOG_GELF_HTTP_URL"))
 
     parser.add_argument(
         "--output-host",
@@ -1636,11 +1861,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--insecure",
         action="store_true",
         help="Disable Greylog API TLS certificate verification.",
-    )
-    parser.add_argument(
-        "--insecure-gelf",
-        action="store_true",
-        help="Disable GELF HTTP TLS certificate verification.",
     )
 
     return parser.parse_args(argv)

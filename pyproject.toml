@@ -36,7 +36,7 @@ select = [
     "B",
     "UP",
 ]
-ignore = []
+ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["greylog_recent_stream_events"]

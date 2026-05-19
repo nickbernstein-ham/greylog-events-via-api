@@ -1,5 +1,6 @@
 import argparse
 import json
+import socket
 
 import pytest
 
@@ -78,6 +79,15 @@ def test_int_from_env_defaults_when_missing_or_invalid():
 
 def test_int_from_env_parses_integer():
     assert app.int_from_env("1514", 514) == 1514
+
+
+def test_float_from_env_defaults_when_missing_or_invalid():
+    assert app.float_from_env(None, 10.0) == 10.0
+    assert app.float_from_env("not-a-float", 10.0) == 10.0
+
+
+def test_float_from_env_parses_float():
+    assert app.float_from_env("2.5", 10.0) == 2.5
 
 
 def test_redact_pii_redacts_common_values():
@@ -243,11 +253,178 @@ def test_truncate_utf8_bytes_leaves_short_text_unchanged():
     assert app.truncate_utf8_bytes("hello", 100) == "hello"
 
 
-def test_truncate_utf8_bytes_truncates_long_text():
-    result = app.truncate_utf8_bytes("a" * 100, 10)
+def test_truncate_utf8_bytes_truncates_long_text_within_limit():
+    result = app.truncate_utf8_bytes("a" * 100, 20)
 
     assert result.endswith("...[TRUNCATED]")
-    assert len(result.encode("utf-8")) > 10
+    assert len(result.encode("utf-8")) <= 20
+
+
+def test_compact_json_serializes_without_spaces():
+    assert app.compact_json({"b": 2, "a": 1}) == '{"a":1,"b":2}'
+
+
+def test_remove_none_values_removes_only_none():
+    result = app.remove_none_values({"a": 1, "b": None, "c": False})
+
+    assert result == {"a": 1, "c": False}
+
+
+def test_build_gelf_custom_fields_contains_routing_and_context_fields():
+    result = app.build_gelf_custom_fields(sample_enriched_message(), "nick-ollama-out")
+
+    assert result["_ollama_output_stream"] == "nick-ollama-out"
+    assert result["_pipeline"] == "greylog-ollama-enrichment"
+    assert result["_original_greylog_id"] == "msg-1"
+    assert result["_original_greylog_index"] == "graylog_0"
+    assert result["_original_source"] == "server01"
+    assert result["_pii_detected"] is True
+    assert result["_ollama_model"] == "qwen3:1.7b"
+    assert result["_likely_component"] == "sip"
+    assert result["_likely_event_type"] == "auth_failure"
+    assert result["_severity_hint"] == "medium"
+    assert json.loads(result["_pii_findings"]) == [{"count": 1, "type": "email"}]
+
+
+def test_build_gelf_payload_contains_required_and_routing_fields(monkeypatch):
+    monkeypatch.setattr(app, "unix_timestamp_now", lambda: 1_716_000_000.25)
+
+    result = app.build_gelf_payload(
+        enriched_message=sample_enriched_message(),
+        output_stream="nick-ollama-out",
+        host="test-host",
+        max_full_message_bytes=60_000,
+    )
+
+    assert result["version"] == "1.1"
+    assert result["host"] == "test-host"
+    assert result["short_message"] == "Test summary"
+    assert result["timestamp"] == 1_716_000_000.25
+    assert result["level"] == 4
+    assert result["_ollama_output_stream"] == "nick-ollama-out"
+    assert result["_pipeline"] == "greylog-ollama-enrichment"
+    assert result["_original_greylog_id"] == "msg-1"
+    assert result["_pii_detected"] is True
+    assert result["_ollama_model"] == "qwen3:1.7b"
+    assert json.loads(result["full_message"])["id"] == "msg-1"
+
+
+def test_build_gelf_payload_truncates_full_message(monkeypatch):
+    monkeypatch.setattr(app, "unix_timestamp_now", lambda: 1_716_000_000.25)
+    enriched = sample_enriched_message()
+    enriched["very_large_field"] = "x" * 10_000
+
+    result = app.build_gelf_payload(
+        enriched_message=enriched,
+        output_stream="nick-ollama-out",
+        host="test-host",
+        max_full_message_bytes=200,
+    )
+
+    assert len(result["full_message"].encode("utf-8")) <= 200
+    assert result["full_message"].endswith("...[TRUNCATED]")
+
+
+def test_encode_gelf_tcp_frame_appends_null_byte():
+    payload = {
+        "version": "1.1",
+        "host": "test-host",
+        "short_message": "hello",
+    }
+
+    result = app.encode_gelf_tcp_frame(payload)
+
+    assert result.endswith(b"\0")
+    assert json.loads(result[:-1].decode("utf-8")) == payload
+
+
+def test_send_gelf_tcp_sends_null_delimited_frame(monkeypatch):
+    captured = {}
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def sendall(self, frame):
+            captured["frame"] = frame
+
+    def fake_create_tcp_connection(host, port, timeout, use_tls, insecure_tls):
+        captured["host"] = host
+        captured["port"] = port
+        captured["timeout"] = timeout
+        captured["use_tls"] = use_tls
+        captured["insecure_tls"] = insecure_tls
+        return FakeSocket()
+
+    monkeypatch.setattr(app, "create_tcp_connection", fake_create_tcp_connection)
+
+    payload = {
+        "version": "1.1",
+        "host": "test-host",
+        "short_message": "hello",
+    }
+
+    result = app.send_gelf_tcp(
+        host="sip.hamiltoncaptel.com",
+        port=12201,
+        payload=payload,
+        timeout=5.0,
+        use_tls=False,
+        insecure_tls=False,
+    )
+
+    assert result["posted"] is True
+    assert result["method"] == "gelf_tcp"
+    assert result["host"] == "sip.hamiltoncaptel.com"
+    assert result["port"] == 12201
+    assert result["tls"] is False
+    assert captured["frame"].endswith(b"\0")
+    assert json.loads(captured["frame"][:-1].decode("utf-8")) == payload
+
+
+def test_post_gelf_tcp_message_builds_and_sends(monkeypatch):
+    captured = {}
+
+    def fake_send_gelf_tcp(host, port, payload, timeout, use_tls, insecure_tls):
+        captured["host"] = host
+        captured["port"] = port
+        captured["payload"] = payload
+        captured["timeout"] = timeout
+        captured["use_tls"] = use_tls
+        captured["insecure_tls"] = insecure_tls
+        return {
+            "posted": True,
+            "method": "gelf_tcp",
+            "host": host,
+            "port": port,
+            "tls": use_tls,
+            "frame_bytes": 123,
+        }
+
+    monkeypatch.setattr(app, "send_gelf_tcp", fake_send_gelf_tcp)
+    monkeypatch.setattr(app, "unix_timestamp_now", lambda: 1_716_000_000.25)
+
+    result = app.post_gelf_tcp_message(
+        enriched_message=sample_enriched_message(),
+        output_stream="nick-ollama-out",
+        gelf_tcp_host="sip.hamiltoncaptel.com",
+        gelf_tcp_port=12201,
+        output_host="script-host",
+        timeout=5.0,
+        use_tls=False,
+        insecure_tls=False,
+        max_full_message_bytes=60_000,
+    )
+
+    assert result["posted"] is True
+    assert result["method"] == "gelf_tcp"
+    assert captured["host"] == "sip.hamiltoncaptel.com"
+    assert captured["port"] == 12201
+    assert captured["payload"]["host"] == "script-host"
+    assert captured["payload"]["_ollama_output_stream"] == "nick-ollama-out"
 
 
 def test_build_syslog_fields_contains_routing_and_context_fields():
@@ -294,22 +471,6 @@ def test_build_syslog_message_contains_route_marker_and_summary():
     assert 'enriched_json="' in result
 
 
-def test_build_syslog_message_respects_max_bytes_approximately():
-    enriched = sample_enriched_message()
-    enriched["context"]["summary"] = "x" * 100
-    enriched["very_large_field"] = "y" * 10_000
-
-    result = app.build_syslog_message(
-        enriched_message=enriched,
-        output_stream="nick-ollama-out",
-        host="test-host",
-        max_bytes=1000,
-    )
-
-    assert len(result.encode("utf-8")) <= 1200
-    assert "[TRUNCATED]" in result
-
-
 def test_send_syslog_udp_sends_bytes(monkeypatch):
     sent = {}
 
@@ -337,94 +498,10 @@ def test_send_syslog_udp_sends_bytes(monkeypatch):
     assert result["host"] == "greylog.example.com"
     assert result["port"] == 514
     assert result["bytes"] == 5
+    assert sent["family"] == socket.AF_INET
+    assert sent["sock_type"] == socket.SOCK_DGRAM
     assert sent["payload"] == b"hello"
     assert sent["destination"] == ("greylog.example.com", 514)
-
-
-def test_post_syslog_udp_message_builds_and_sends(monkeypatch):
-    captured = {}
-
-    def fake_send_syslog_udp(host, port, message):
-        captured["host"] = host
-        captured["port"] = port
-        captured["message"] = message
-        return {
-            "posted": True,
-            "method": "syslog_udp",
-            "host": host,
-            "port": port,
-            "bytes": len(message.encode("utf-8")),
-        }
-
-    monkeypatch.setattr(app, "send_syslog_udp", fake_send_syslog_udp)
-
-    result = app.post_syslog_udp_message(
-        enriched_message=sample_enriched_message(),
-        output_stream="nick-ollama-out",
-        syslog_host="sip.hamiltoncaptel.com",
-        syslog_port=514,
-        output_host="script-host",
-        max_bytes=60_000,
-    )
-
-    assert result["posted"] is True
-    assert result["method"] == "syslog_udp"
-    assert captured["host"] == "sip.hamiltoncaptel.com"
-    assert captured["port"] == 514
-    assert 'ollama_output_stream="nick-ollama-out"' in captured["message"]
-
-
-def test_build_gelf_payload_contains_required_and_routing_fields():
-    result = app.build_gelf_payload(
-        enriched_message=sample_enriched_message(),
-        output_stream="nick-ollama-out",
-        host="test-host",
-    )
-
-    assert result["version"] == "1.1"
-    assert result["host"] == "test-host"
-    assert result["short_message"] == "Test summary"
-    assert result["level"] == 4
-    assert result["_ollama_output_stream"] == "nick-ollama-out"
-    assert result["_pipeline"] == "greylog-ollama-enrichment"
-    assert result["_original_greylog_id"] == "msg-1"
-    assert result["_original_greylog_index"] == "graylog_0"
-    assert result["_pii_detected"] is True
-    assert result["_ollama_model"] == "qwen3:1.7b"
-    assert json.loads(result["full_message"])["id"] == "msg-1"
-
-
-def test_post_gelf_payload_posts_json(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        status_code = 202
-
-        def raise_for_status(self):
-            return None
-
-    def fake_post(url, json, headers, timeout, verify):
-        captured["url"] = url
-        captured["json"] = json
-        captured["headers"] = headers
-        captured["timeout"] = timeout
-        captured["verify"] = verify
-        return FakeResponse()
-
-    monkeypatch.setattr(app.requests, "post", fake_post)
-
-    result = app.post_gelf_payload(
-        gelf_http_url="http://greylog.example.com:12201/gelf",
-        payload={"version": "1.1", "host": "test", "short_message": "hello"},
-        verify_tls=False,
-    )
-
-    assert result["posted"] is True
-    assert result["method"] == "gelf_http"
-    assert result["status_code"] == 202
-    assert captured["url"] == "http://greylog.example.com:12201/gelf"
-    assert captured["headers"] == {"Content-Type": "application/json"}
-    assert captured["verify"] is False
 
 
 def test_maybe_post_enriched_message_skips_when_disabled():
@@ -437,16 +514,53 @@ def test_maybe_post_enriched_message_skips_when_disabled():
     assert result == {"posted": False, "reason": "disabled"}
 
 
-def test_maybe_post_enriched_message_skips_gelf_when_missing_url():
+def test_maybe_post_enriched_message_uses_gelf_tcp(monkeypatch):
+    captured = {}
+
+    def fake_post_gelf_tcp_message(
+        enriched_message,
+        output_stream,
+        gelf_tcp_host,
+        gelf_tcp_port,
+        output_host,
+        timeout,
+        use_tls,
+        insecure_tls,
+        max_full_message_bytes,
+    ):
+        captured["enriched_message"] = enriched_message
+        captured["output_stream"] = output_stream
+        captured["gelf_tcp_host"] = gelf_tcp_host
+        captured["gelf_tcp_port"] = gelf_tcp_port
+        captured["output_host"] = output_host
+        captured["timeout"] = timeout
+        captured["use_tls"] = use_tls
+        captured["insecure_tls"] = insecure_tls
+        captured["max_full_message_bytes"] = max_full_message_bytes
+        return {"posted": True, "method": "gelf_tcp"}
+
+    monkeypatch.setattr(app, "post_gelf_tcp_message", fake_post_gelf_tcp_message)
+
     args = argparse.Namespace(
         post_output=True,
-        output_method="gelf_http",
-        gelf_http_url=None,
+        output_method="gelf_tcp",
+        output_stream="nick-ollama-out",
+        gelf_tcp_host="sip.hamiltoncaptel.com",
+        gelf_tcp_port=12201,
+        output_host="script-host",
+        gelf_tcp_timeout=5.0,
+        gelf_tcp_tls=False,
+        gelf_tcp_insecure_tls=False,
+        max_gelf_full_message_bytes=60_000,
     )
 
     result = app.maybe_post_enriched_message(args, sample_enriched_message())
 
-    assert result == {"posted": False, "reason": "missing_gelf_http_url"}
+    assert result == {"posted": True, "method": "gelf_tcp"}
+    assert captured["output_stream"] == "nick-ollama-out"
+    assert captured["gelf_tcp_host"] == "sip.hamiltoncaptel.com"
+    assert captured["gelf_tcp_port"] == 12201
+    assert captured["output_host"] == "script-host"
 
 
 def test_maybe_post_enriched_message_uses_syslog_udp(monkeypatch):
@@ -486,45 +600,6 @@ def test_maybe_post_enriched_message_uses_syslog_udp(monkeypatch):
     assert captured["output_stream"] == "nick-ollama-out"
     assert captured["syslog_host"] == "sip.hamiltoncaptel.com"
     assert captured["syslog_port"] == 514
-    assert captured["output_host"] == "script-host"
-    assert captured["max_bytes"] == 60_000
-
-
-def test_maybe_post_enriched_message_uses_gelf_http(monkeypatch):
-    captured = {}
-
-    def fake_post_gelf_http_message(
-        enriched_message,
-        gelf_http_url,
-        output_stream,
-        host,
-        verify_tls,
-    ):
-        captured["enriched_message"] = enriched_message
-        captured["gelf_http_url"] = gelf_http_url
-        captured["output_stream"] = output_stream
-        captured["host"] = host
-        captured["verify_tls"] = verify_tls
-        return {"posted": True, "method": "gelf_http"}
-
-    monkeypatch.setattr(app, "post_gelf_http_message", fake_post_gelf_http_message)
-
-    args = argparse.Namespace(
-        post_output=True,
-        output_method="gelf_http",
-        gelf_http_url="http://greylog.example.com:12201/gelf",
-        output_stream="nick-ollama-out",
-        output_host="script-host",
-        insecure_gelf=False,
-    )
-
-    result = app.maybe_post_enriched_message(args, sample_enriched_message())
-
-    assert result == {"posted": True, "method": "gelf_http"}
-    assert captured["gelf_http_url"] == "http://greylog.example.com:12201/gelf"
-    assert captured["output_stream"] == "nick-ollama-out"
-    assert captured["host"] == "script-host"
-    assert captured["verify_tls"] is True
 
 
 def test_maybe_post_enriched_message_rejects_unknown_method():
@@ -645,7 +720,9 @@ def test_extract_tool_calls_returns_tuple():
     assert result[0]["function"]["name"] == "redact_pii"
 
 
-def test_call_redaction_tool_via_ollama_falls_back_when_model_does_not_call_tool(monkeypatch):
+def test_call_redaction_tool_via_ollama_falls_back_when_model_does_not_call_tool(
+    monkeypatch,
+):
     def fake_call_ollama(**kwargs):
         return {"message": {"content": "no tool call"}}
 
@@ -770,20 +847,32 @@ def test_build_context_messages_includes_redacted_message_not_original():
     assert "nick@example.com" not in result[0]["content"]
 
 
-def test_parse_args_reads_syslog_defaults_from_environment(monkeypatch):
-    monkeypatch.setenv("GRAYLOG_OUTPUT_METHOD", "syslog_udp")
-    monkeypatch.setenv("GRAYLOG_SYSLOG_HOST", "sip.hamiltoncaptel.com")
-    monkeypatch.setenv("GRAYLOG_SYSLOG_PORT", "1514")
+def test_parse_args_reads_gelf_tcp_defaults_from_environment(monkeypatch):
+    monkeypatch.setenv("GRAYLOG_OUTPUT_METHOD", "gelf_tcp")
+    monkeypatch.setenv("GRAYLOG_GELF_TCP_HOST", "sip.hamiltoncaptel.com")
+    monkeypatch.setenv("GRAYLOG_GELF_TCP_PORT", "12201")
+    monkeypatch.setenv("GRAYLOG_GELF_TCP_TIMEOUT", "2.5")
+    monkeypatch.setenv("GRAYLOG_GELF_TCP_TLS", "true")
     monkeypatch.setenv("GRAYLOG_OUTPUT_STREAM", "nick-ollama-out")
-    monkeypatch.setenv("MAX_SYSLOG_BYTES", "4096")
+    monkeypatch.setenv("MAX_GELF_FULL_MESSAGE_BYTES", "4096")
 
     args = app.parse_args([])
 
-    assert args.output_method == "syslog_udp"
-    assert args.syslog_host == "sip.hamiltoncaptel.com"
-    assert args.syslog_port == 1514
+    assert args.output_method == "gelf_tcp"
+    assert args.gelf_tcp_host == "sip.hamiltoncaptel.com"
+    assert args.gelf_tcp_port == 12201
+    assert args.gelf_tcp_timeout == 2.5
+    assert args.gelf_tcp_tls is True
     assert args.output_stream == "nick-ollama-out"
-    assert args.max_syslog_bytes == 4096
+    assert args.max_gelf_full_message_bytes == 4096
+
+
+def test_parse_args_can_disable_gelf_tcp_tls_from_environment(monkeypatch):
+    monkeypatch.setenv("GRAYLOG_GELF_TCP_TLS", "true")
+
+    args = app.parse_args(["--no-gelf-tcp-tls"])
+
+    assert args.gelf_tcp_tls is False
 
 
 def test_parse_args_can_disable_post_output():
